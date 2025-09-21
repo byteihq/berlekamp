@@ -1,0 +1,38 @@
+# Visual Studio files
+.vs/
+*.suo
+*.user
+*.ncb
+*.sdf
+*.opendb
+*.vcproj.user
+*.vcxproj.user
+*.vspscc
+*.vssscc
+
+# Build artifacts
+Debug/
+Release/
+x64/
+Win32/
+bin/
+obj/
+out/
+ipch/
+*.obj
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.aps
+*.res
+
+# Temporary files
+*.~*
+*.tmp
+*.log
+*.bak
+
+# CMake
+CMakePresets.json

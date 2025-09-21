@@ -306,132 +306,106 @@ vector<int> matrix_rref(vector<vector<int64>>& M) {
 }
 
 vector<Poly> berlekamp(const Poly& F) {
-    // F must be monic and squarefree
     cout << "[berlekamp] factoring (squarefree) " << F.str() << "\n";
-    vector<Poly> res;
-    if (F.isZero()) return res;
-    if (F.deg() <= 0) return res;
-    if (F.deg() == 1) { res.push_back(F); return res; }
+    vector<Poly> result;
+    if (F.isZero()) return result;
+    if (F.deg() <= 0) return result;
+    if (F.deg() == 1) { result.push_back(F); return result; }
     int n = F.deg();
 
-    // Build Q matrix: columns are coefficients of x^{p*j} mod F for j=0..n-1
+    // === 1. Построение матрицы Q ===
     cout << "[berlekamp] building Q matrix (size " << n << ")...\n";
-    // base x polynomial
     Poly X; X.a = { 0,1 }; X.normalize();
-    // compute xp = x^p mod F
     Poly xp = poly_powmod(X, P, F);
-    // prepare matrix M of size n x n
-    vector<vector<int64>> M(n, vector<int64>(n, 0));
-    for (int j = 0; j < n; ++j) {
-        Poly col = poly_powmod(xp, j, F); // (x^p)^j mod F = x^{p*j} mod F
-        // place coefficients into column j
-        for (int i = 0; i < n; ++i) M[i][j] = col.coeff(i);
-    }
-    // subtract identity: M <- M - I
-    for (int i = 0; i < n; ++i) M[i][i] = modnorm(M[i][i] - 1);
 
-    // Log matrix (careful with size)
-    cout << "[berlekamp] matrix (M = Q - I):\n";
+    vector<vector<int64>> Q(n, vector<int64>(n, 0));
+    for (int j = 0; j < n; ++j) {
+        Poly col = poly_powmod(xp, j, F); // x^(p*j) mod F
+        for (int i = 0; i < n; ++i) Q[i][j] = col.coeff(i);
+    }
+
+    // Q - I
+    for (int i = 0; i < n; ++i) Q[i][i] = modnorm(Q[i][i] - 1);
+
+    cout << "[berlekamp] matrix (Q - I):\n";
     for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j) cout << M[i][j] << ' ';
+        for (int j = 0; j < n; ++j) cout << Q[i][j] << ' ';
         cout << '\n';
     }
 
-    // compute nullspace by RREF
-    auto Mcopy = M; // we'll modify
-    auto piv = matrix_rref(Mcopy);
+    // === 2. Базис ядра ===
+    auto Qcopy = Q;
+    auto piv = matrix_rref(Qcopy);
 
-    // find pivot columns
     vector<int> pivot_of_col(n, -1);
-    for (int r = 0; r < (int)piv.size(); ++r) if (piv[r] != -1) pivot_of_col[piv[r]] = r;
+    for (int r = 0; r < (int)piv.size(); ++r)
+        if (piv[r] != -1) pivot_of_col[piv[r]] = r;
 
     vector<int> free_cols;
-    for (int c = 0; c < n; ++c) if (pivot_of_col[c] == -1) free_cols.push_back(c);
-    cout << "[berlekamp] nullspace dimension = " << free_cols.size() << " (free cols)\n";
+    for (int c = 0; c < n; ++c)
+        if (pivot_of_col[c] == -1) free_cols.push_back(c);
 
-    // build basis polynomials for nullspace: for each free col, set that var=1 and solve for pivot vars
+    cout << "[berlekamp] nullspace dimension = " << free_cols.size() << "\n";
+
     vector<Poly> basis;
     for (int idx = 0; idx < (int)free_cols.size(); ++idx) {
         int fc = free_cols[idx];
         vector<int64> vec(n, 0);
         vec[fc] = 1;
-        // for each pivot row r with pivot col c: v[c] = -Mcopy[r][fc]
         for (int r = 0; r < (int)piv.size(); ++r) {
             int c = piv[r];
             if (c == -1) continue;
-            vec[c] = modnorm(-Mcopy[r][fc]);
+            vec[c] = modnorm(-Qcopy[r][fc]);
         }
-        Poly b;
-        b.a = vec; b.normalize();
+        Poly b; b.a = vec; b.normalize();
         cout << "[berlekamp] basis[" << idx << "] = " << b.str() << "\n";
         basis.push_back(b);
     }
 
     if (basis.empty()) {
-        // nullspace trivial -> irreducible
-        cout << "[berlekamp] nullspace trivial -> polynomial irreducible: " << F.str() << "\n";
-        res.push_back(F);
-        return res;
+        cout << "[berlekamp] nullspace trivial -> irreducible: " << F.str() << "\n";
+        result.push_back(F);
+        return result;
+    }
+    if ((int)basis.size() == 1 && basis[0].deg() == 0) {
+        cout << "[berlekamp] nullspace contains only constants -> irreducible\n";
+        result.push_back(F);
+        return result;
     }
 
-    if ((int)basis.size() == 1) {
-        // only constants (dimension 1) => irreducible
-        bool onlyConst = (basis[0].deg() == 0);
-        if (onlyConst) {
-            cout << "[berlekamp] nullspace contains only constants -> irreducible\n";
-            res.push_back(F);
-            return res;
-        }
-    }
+    // === 3. Перебор базиса и констант ===
+    for (size_t bi = 0; bi < basis.size(); ++bi) {
+        const Poly& v = basis[bi];
+        if (v.deg() == 0) continue; // пропускаем константу
+        cout << "[berlekamp] trying basis vector: " << v.str() << "\n";
+        for (int c = 0; c < P; ++c) {
+            Poly h = v;
+            if (h.a.empty()) h.a = { 0 };
+            h.a[0] = modnorm(h.a[0] - c);
+            h.normalize();
 
-    // random search for non-trivial factor using random linear combinations in the nullspace
-    std::random_device rd; std::mt19937_64 gen(rd());
-    uniform_int_distribution<int64> distCoeff(0, P - 1);
-
-    int max_tries = max(30, n * 5);
-    for (int attempt = 0; attempt < max_tries; ++attempt) {
-        // pick random linear combination b(x) = sum r_i * basis[i]
-        vector<int64> coeffs(n, 0);
-        bool allzero = true;
-        for (int i = 0; i < (int)basis.size(); ++i) {
-            int64 r = distCoeff(gen);
-            if (r != 0) allzero = false;
-            for (int j = 0; j <= basis[i].deg(); ++j) coeffs[j] = modnorm(coeffs[j] + r * basis[i].coeff(j));
-        }
-        if (allzero) { attempt--; continue; } // try again
-        Poly Bp; Bp.a = coeffs; Bp.normalize();
-        cout << "[berlekamp] attempt " << attempt << ", random B(x) = " << Bp.str() << "\n";
-        // try random constants c in GF(p)
-        for (int ct = 0; ct < 4; ++ct) {
-            int64 c = distCoeff(gen);
-            // form h(x) = Bp - c
-            Poly H = Bp;
-            if (H.a.empty()) H.a = { 0 };
-            H.a[0] = modnorm(H.a[0] - c);
-            H.normalize();
-            Poly g = poly_gcd(F, H);
-            cout << "[berlekamp] try c=" << c << ", gcd deg=" << (g.isZero() ? 0 : g.deg()) << "; gcd=" << (g.isZero() ? string("0") : g.str()) << "\n";
+            Poly g = poly_gcd(F, h);
             if (!g.isZero() && g.deg() >= 1 && g.deg() < F.deg()) {
-                // non-trivial factor found
-                cout << "[berlekamp] non-trivial factor found: " << g.str() << "\n";
+                cout << "[berlekamp] non-trivial factor found: " << g.str()
+                    << " (with c=" << c << ")\n";
                 Poly f1 = g;
-                // compute f2 = F / f1
                 Poly f2 = poly_divmod(F, f1).first;
-                // recursively factor f1 and f2
+
                 auto r1 = berlekamp(f1);
                 auto r2 = berlekamp(f2);
-                res.insert(res.end(), r1.begin(), r1.end());
-                res.insert(res.end(), r2.begin(), r2.end());
-                return res;
+                result.insert(result.end(), r1.begin(), r1.end());
+                result.insert(result.end(), r2.begin(), r2.end());
+                return result;
             }
         }
     }
 
-    // if failed to split, treat as irreducible (rare; could increase attempts)
-    cout << "[berlekamp] failed to find factor after " << max_tries << " attempts; treating as irreducible: " << F.str() << "\n";
-    res.push_back(F);
-    return res;
+    // === 4. Если ничего не нашли ===
+    cout << "[berlekamp] failed to split -> irreducible: " << F.str() << "\n";
+    result.push_back(F);
+    return result;
 }
+
 
 // full factorization using squarefree + berlekamp
 vector<pair<Poly, int>> factor_poly(const Poly& F) {
