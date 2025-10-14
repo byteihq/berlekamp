@@ -1,16 +1,43 @@
-﻿#include <iostream>
-#include <vector>
+﻿#include "poly.h"
+
+#include <iostream>
 #include <string>
-#include <cassert>
 
-using poly_obj_t = uint64_t;
+std::string format(const Poly& p)
+{
+    if (p.isZero())
+        return "0";
 
-static poly_obj_t P = 2; // глобальный модуль поля (prime)
+    std::string s;
 
+    for (size_t i = p.deg(); i > 0; --i) {
+        const auto& c = p[i];
+        if (c == 0)
+            continue;
+
+        if (!s.empty())
+            s += " + ";
+
+        s += std::to_string(c);
+        s += "*x";
+
+        if (i > 1)
+            s += "^" + std::to_string(i);
+    }
+
+    if (p[0] != 0)
+    {
+        if (!s.empty())
+            s += " + ";
+        s += std::to_string(p[0]);
+    }
+
+    return s;
+}
 
 // Gaussian elimination to compute RREF of matrix (rows x cols) over GF(P)
 // it modifies matrix to RREF and returns pivot_col_for_row (size rows) with -1 for zero rows
-std::vector<int> matrix_rref(std::vector<std::vector<poly_obj_t>>& M) {
+std::vector<int> matrix_rref(std::vector<std::vector<Poly::value_t>>& M, Poly::value_t P) {
     size_t rows = M.size();
     if (rows == 0) return {};
     size_t cols = M[0].size();
@@ -22,14 +49,21 @@ std::vector<int> matrix_rref(std::vector<std::vector<poly_obj_t>>& M) {
         for (size_t i = r; i < rows; ++i) if (M[i][c] != 0) { sel = (int)i; break; }
         if (sel == -1) continue;
         swap(M[r], M[sel]);
-        poly_obj_t inv = inv_mod(M[r][c]);
+        Poly::value_t inv = inv_mod(M[r][c], P);
         // scale row r to make pivot 1
-        for (size_t j = c; j < cols; ++j) M[r][j] = modnorm(M[r][j] * inv);
+        for (size_t j = c; j < cols; ++j) M[r][j] = modnorm(M[r][j] * inv, P);
         // eliminate other rows
         for (size_t i = 0; i < rows; ++i) if (i != r && M[i][c] != 0) {
-            poly_obj_t factor = M[i][c];
+            Poly::value_t factor = M[i][c];
             for (size_t j = c; j < cols; ++j) {
-                M[i][j] = modnorm(M[i][j] - factor * M[r][j]);
+                if (const auto rhs = (factor * M[r][j]) % P; M[i][j] < rhs)
+                {
+                    M[i][j] = modnorm(P + M[i][j] - rhs, P);
+                }
+                else
+                {
+                    M[i][j] = modnorm(M[i][j] - rhs, P);
+                }
             }
         }
         pivot_col_for_row[r] = (int)c;
@@ -39,7 +73,8 @@ std::vector<int> matrix_rref(std::vector<std::vector<poly_obj_t>>& M) {
 }
 
 std::vector<Poly> berlekamp(const Poly& F) {
-    std::cout << "[berlekamp] factoring (squarefree) " << F.str() << "\n";
+    std::cout << "[berlekamp] factoring (squarefree) " << format(F) << "\n";
+
     std::vector<Poly> result;
     if (F.isZero()) return result;
     if (F.deg() <= 0) return result;
@@ -48,17 +83,20 @@ std::vector<Poly> berlekamp(const Poly& F) {
 
     // === 1. Построение матрицы Q ===
     std::cout << "[berlekamp] building Q matrix (size " << n << ")...\n";
-    Poly X; X.a = { 0,1 }; X.normalize();
-    Poly xp = poly_powmod(X, P, F);
+    Poly X({0, 1}, F.getMod());
+    
+    Poly xp = poly_powmod(X, F.getMod(), F);
+    xp.normalize();
 
-    std::vector<std::vector<poly_obj_t>> Q(n, std::vector<poly_obj_t>(n, 0));
+    std::vector<std::vector<Poly::value_t>> Q(n, std::vector<Poly::value_t>(n, 0));
     for (size_t j = 0; j < n; ++j) {
         Poly col = poly_powmod(xp, j, F); // x^(p*j) mod F
-        for (size_t i = 0; i < col.a.size(); ++i) Q[i][j] = col.coeff(i);
+        for (size_t i = 0; i < col.deg() + 1; ++i)
+            Q[i][j] = col[i];
     }
 
     // Q - I
-    for (size_t i = 0; i < n; ++i) Q[i][i] = modnorm(Q[i][i] - 1);
+    for (size_t i = 0; i < n; ++i) Q[i][i] = modnorm(Q[i][i] - 1, F.getMod());
 
     std::cout << "[berlekamp] matrix (Q - I):\n";
     for (size_t i = 0; i < n; ++i) {
@@ -68,7 +106,7 @@ std::vector<Poly> berlekamp(const Poly& F) {
 
     // === 2. Базис ядра ===
     auto Qcopy = Q;
-    auto piv = matrix_rref(Qcopy);
+    auto piv = matrix_rref(Qcopy, F.getMod());
 
     std::vector<int> pivot_of_col(n, -1);
     for (int r = 0; r < (int)piv.size(); ++r)
@@ -76,31 +114,34 @@ std::vector<Poly> berlekamp(const Poly& F) {
 
     std::vector<int> free_cols;
     for (int c = 0; c < n; ++c)
-        if (pivot_of_col[c] == -1) free_cols.push_back(c);
+        if (pivot_of_col[c] == -1)
+            free_cols.push_back(c);
 
     std::cout << "[berlekamp] nullspace dimension = " << free_cols.size() << "\n";
 
     std::vector<Poly> basis;
-    for (int idx = 0; idx < (int)free_cols.size(); ++idx) {
+    for (size_t idx = 0; idx < free_cols.size(); ++idx) {
         int fc = free_cols[idx];
-        std::vector<poly_obj_t> vec(n, 0);
+        std::vector<Poly::value_t> vec(n, 0);
         vec[fc] = 1;
         for (int r = 0; r < (int)piv.size(); ++r) {
             int c = piv[r];
             if (c == -1) continue;
-            vec[c] = modnorm(P - Qcopy[r][fc]);
+            vec[c] = modnorm(F.getMod() - Qcopy[r][fc], F.getMod());
         }
-        Poly b; b.a = vec; b.normalize();
-        std::cout << "[berlekamp] basis[" << idx << "] = " << b.str() << "\n";
-        basis.push_back(b);
+
+        Poly b(vec, F.getMod());
+        b.normalize();
+        std::cout << "[berlekamp] basis[" << idx << "] = " << format(b) << "\n";
+        basis.push_back(std::move(b));
     }
 
     if (basis.empty()) {
-        std::cout << "[berlekamp] nullspace trivial -> irreducible: " << F.str() << "\n";
+        std::cout << "[berlekamp] nullspace trivial -> irreducible: " << format(F) << "\n";
         result.push_back(F);
         return result;
     }
-    if ((int)basis.size() == 1 && basis[0].deg() == 0) {
+    if (basis.size() == 1 && basis.front().deg() == 0) {
         std::cout << "[berlekamp] nullspace contains only constants -> irreducible\n";
         result.push_back(F);
         return result;
@@ -110,16 +151,26 @@ std::vector<Poly> berlekamp(const Poly& F) {
     for (size_t bi = 0; bi < basis.size(); ++bi) {
         const Poly& v = basis[bi];
         if (v.deg() == 0) continue; // пропускаем константу
-        std::cout << "[berlekamp] trying basis vector: " << v.str() << "\n";
-        for (int c = 0; c < P; ++c) {
+        std::cout << "[berlekamp] trying basis vector: " << format(v) << "\n";
+
+        for (size_t c = 0; c < F.getMod(); ++c) {
             Poly h = v;
-            if (h.a.empty()) h.a = { 0 };
-            h.a[0] = modnorm(h.a[0] - c);
+            if (h.isZero())
+                h.push(F.getMod());
+
+            if (const auto rhs = c % F.getMod(); h[0] < rhs)
+            {
+                h[0] = modnorm(F.getMod() + h[0] - rhs, F.getMod());
+            }
+            else
+            {
+                h[0] = modnorm(h[0] - c, F.getMod());
+            }
             h.normalize();
 
             Poly g = poly_gcd(F, h);
             if (!g.isZero() && g.deg() >= 1 && g.deg() < F.deg()) {
-                std::cout << "[berlekamp] non-trivial factor found: " << g.str()
+                std::cout << "[berlekamp] non-trivial factor found: " << format(g)
                     << " (with c=" << c << ")\n";
                 Poly f1 = g;
                 Poly f2 = poly_divmod(F, f1).first;
@@ -134,45 +185,47 @@ std::vector<Poly> berlekamp(const Poly& F) {
     }
 
     // === 4. Если ничего не нашли ===
-    std::cout << "[berlekamp] failed to split -> irreducible: " << F.str() << "\n";
+    std::cout << "[berlekamp] failed to split -> irreducible: " << format(F) << "\n";
     result.push_back(F);
     return result;
 }
 
-
 // full factorization using squarefree + berlekamp
-std::vector<Poly> factor_poly(const Poly& F) {
-    std::cout << "[factor] starting full factorization for " << F.str() << "\n";
+std::vector<Poly> factor_poly(Poly& F) {
+    std::cout << "[factor] starting full factorization for " << format(F) << "\n";
+
+    F.normalize();
     if (F.isZero()) return {};
 
-    // сделать коэф при старшей степени 1
-    Poly f = F;
-    f.normalize();
-    // make monic
-    if (!f.isZero()) {
-        poly_obj_t invLead = inv_mod(f.coeff(f.deg()));
-        f = poly_scalar_mul(f, invLead);
-    }
+    Poly::value_t invLead = inv_mod(F[F.deg()], F.getMod());
+    F = poly_scalar_mul(F, invLead);
+    F.normalize();
 
-    return berlekamp(f);
+    return berlekamp(F);
 }
 
 int main() {
     std::cout << "Berlekamp factorization (no external libs)\n";
     std::cout << "Enter prime p, degree n, and n+1 coefficients (highest first):\n";
-    if (!(std::cin >> P)) return 0;
-    size_t n; std::cin >> n;
-    std::vector<poly_obj_t> coeffs(n + 1);
-    for (int i = 0; i <= n; ++i) std::cin >> coeffs[i];
-    Poly f = poly_make_from_coeffs(coeffs);
-    std::cout << "Input polynomial: " << f.str() << " over GF(" << P << ")\n";
-    try {
-        auto res = factor_poly(f);
-        std::cout << "\n=== RESULT: irreducible factors (factor, multiplicity) ===\n";
-        for (auto& pr : res) std::cout << "(" << pr.str() << ")\n";
-    }
-    catch (const std::exception& ex) {
-        std::cerr << "Error: " << ex.what() << "\n";
-    }
+
+    uint64_t mod;
+    if (!(std::cin >> mod))
+        return 0;
+
+    size_t n;
+    std::cin >> n;
+
+    std::vector<Poly::value_t> coeffs(n + 1);
+    for (int i = static_cast<int>(n); i >= 0; --i)
+        std::cin >> coeffs[i];
+
+    Poly f(coeffs, mod);
+    std::cout << "Input polynomial: over GF(" << mod << ")\n";
+
+    auto res = factor_poly(f);
+    std::cout << "\n=== RESULT: irreducible factors (factor, multiplicity) ===\n";
+    for (auto& pr : res)
+        std::cout << "(" << format(pr) << ")\n";
+
     return 0;
 }

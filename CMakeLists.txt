@@ -14,7 +14,3 @@ add_compile_options(/W3 /WX)
 project ("berlekamp")
 
 add_executable (${PROJECT_NAME} berlekamp.cpp poly.cpp)
-
-if (CMAKE_VERSION VERSION_GREATER 3.12)
-  set_property(TARGET berlekamp PROPERTY CXX_STANDARD 20)
-endif()
