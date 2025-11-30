@@ -1,5 +1,6 @@
 ﻿#include "poly.h"
 
+#include <chrono>
 #include <iostream>
 #include <string>
 
@@ -222,10 +223,16 @@ int main() {
     Poly f(coeffs, mod);
     std::cout << "Input polynomial: over GF(" << mod << ")\n";
 
+    auto t0 = std::chrono::high_resolution_clock::now();
     auto res = factor_poly(f);
+    auto t1 = std::chrono::high_resolution_clock::now();
+
     std::cout << "\n=== RESULT: irreducible factors (factor, multiplicity) ===\n";
     for (auto& pr : res)
         std::cout << "(" << format(pr) << ")\n";
+
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    std::cout << "Elapsed time: " << ms << " ms\n";
 
     return 0;
 }

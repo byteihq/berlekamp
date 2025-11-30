@@ -1,4 +1,4 @@
-﻿cmake_minimum_required (VERSION 3.8)
+﻿cmake_minimum_required (VERSION 3.11)
 
 if (POLICY CMP0141)
   cmake_policy(SET CMP0141 NEW)
@@ -13,4 +13,22 @@ add_compile_options(/W3 /WX)
 
 project ("berlekamp")
 
-add_executable (${PROJECT_NAME} berlekamp.cpp poly.cpp)
+# Main reference (original) executable
+add_executable(berlekamp berlekamp.cpp poly.cpp)
+
+# Parallel executable using OpenCL
+add_executable(parallel parallel.cpp poly.cpp)
+
+# Try to find OpenCL and link to 'parallel' target if found
+find_package(OpenCL)
+if (OpenCL_FOUND)
+  message(STATUS "Found OpenCL: ${OpenCL_INCLUDE_DIRS}")
+  target_include_directories(parallel PRIVATE ${OpenCL_INCLUDE_DIRS})
+  if (TARGET OpenCL::OpenCL)
+    target_link_libraries(parallel PRIVATE OpenCL::OpenCL)
+  else()
+    target_link_libraries(parallel PRIVATE ${OpenCL_LIBRARIES})
+  endif()
+else()
+  message(WARNING "OpenCL not found. 'parallel' will build but use CPU fallback.")
+endif()
