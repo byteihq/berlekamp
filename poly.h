@@ -34,6 +34,7 @@ public:
     [[msvc::forceinline]] void push(value_t v) { data.push_back(v); }
 
     void normalize();
+    [[msvc::forceinline]] void setNormalize() { is_normalized = true; }
 
 private:
     value_t M;

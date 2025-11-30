@@ -14,10 +14,7 @@ add_compile_options(/W3 /WX)
 project ("berlekamp")
 
 # Main reference (original) executable
-add_executable(berlekamp berlekamp.cpp poly.cpp)
-
-# Parallel executable using OpenCL
-add_executable(parallel parallel.cpp poly.cpp)
+add_executable(berlekamp berlekamp.cpp  poly.cpp)
 
 # Try to find OpenCL and link to 'parallel' target if found
 find_package(OpenCL)

@@ -7,6 +7,20 @@
 #include <chrono>
 #include <string>
 
+#if defined(__has_include)
+#  if __has_include(<CL/cl.h>)
+#    include <CL/cl.h>
+#    define HAVE_OPENCL 1
+#  elif __has_include(<OpenCL/opencl.h>)
+#    include <OpenCL/opencl.h>
+#    define HAVE_OPENCL 1
+#  else
+#    define HAVE_OPENCL 0
+#  endif
+#else
+#  define HAVE_OPENCL 0
+#endif
+
 #define LOG std::cout
 
 #ifndef NDEBUG
@@ -15,11 +29,220 @@
 struct Dummy {
     constexpr Dummy() {}
     template<typename T>
-    inline constexpr Dummy& operator<<(const T&) const { return *this;  }
+    inline constexpr const Dummy& operator<<(const T&) const { return *this;  }
 };
 static constexpr Dummy __d{};
 #define DLOG __d
 #endif
+
+static void build_Q_cpu(const Poly& F, std::vector<std::vector<Poly::value_t>>& Q) {
+    size_t n = F.deg();
+    Q.assign(n, std::vector<Poly::value_t>(n, 0));
+    Poly X({ 0,1 }, F.getMod());
+    Poly xp = poly_powmod(X, F.getMod(), F);
+    xp.normalize();
+    for (size_t j = 0; j < n; ++j) {
+        Poly col = poly_powmod(xp, j, F);
+        for (size_t i = 0; i < col.deg() + 1; ++i) Q[i][j] = col[i];
+    }
+}
+
+#if HAVE_OPENCL
+static const char* kernelTemplate = R"CLC(
+#define MAXN %d
+__kernel void compute_columns(__global const ulong* Fcoeffs, const uint n, const ulong P, __global const ulong* xp, __global ulong* out) {
+    const uint j = get_global_id(0);
+    if (j >= n) return;
+
+    ulong res[MAXN];
+    ulong base[MAXN];
+    ulong temp[2*MAXN];
+
+    for (uint i = 0; i < n; ++i) { res[i] = 0UL; base[i] = xp[i] % P; }
+    for (uint i = n; i < MAXN; ++i) res[i] = 0UL;
+    res[0] = 1UL;
+
+    uint exp = j;
+    while (exp > 0) {
+        if (exp & 1u) {
+            // res = res * base
+            for (uint t = 0; t < 2*n; ++t) temp[t] = 0UL;
+            for (uint u = 0; u < n; ++u) {
+                if (res[u] == 0UL) continue;
+                for (uint v = 0; v < n; ++v) {
+                    if (base[v] == 0UL) continue;
+                    ulong prod = (res[u] * base[v]) % P;
+                    uint idx = u + v;
+                    temp[idx] = (temp[idx] + prod) % P;
+                }
+            }
+            // reduce
+            for (int k = (int)(2*n - 2); k >= (int)n; --k) {
+                ulong coef = temp[k] % P;
+                if (coef == 0UL) continue;
+                for (uint t = 1; t <= n; ++t) {
+                    ulong sub = (coef * Fcoeffs[n - t]) % P;
+                    if (temp[k - t] < sub) temp[k - t] = (P + temp[k - t] - sub) % P;
+                    else temp[k - t] = (temp[k - t] - sub) % P;
+                }
+                temp[k] = 0UL;
+            }
+            for (uint i = 0; i < n; ++i) res[i] = temp[i] % P;
+        }
+        // base = base * base
+        {
+            for (uint t = 0; t < 2*n; ++t) temp[t] = 0UL;
+            for (uint u = 0; u < n; ++u) {
+                if (base[u] == 0UL) continue;
+                for (uint v = 0; v < n; ++v) {
+                    if (base[v] == 0UL) continue;
+                    ulong prod = (base[u] * base[v]) % P;
+                    uint idx = u + v;
+                    temp[idx] = (temp[idx] + prod) % P;
+                }
+            }
+            for (int k = (int)(2*n - 2); k >= (int)n; --k) {
+                ulong coef = temp[k] % P;
+                if (coef == 0UL) continue;
+                for (uint t = 1; t <= n; ++t) {
+                    ulong sub = (coef * Fcoeffs[n - t]) % P;
+                    if (temp[k - t] < sub) temp[k - t] = (P + temp[k - t] - sub) % P;
+                    else temp[k - t] = (temp[k - t] - sub) % P;
+                }
+                temp[k] = 0UL;
+            }
+            for (uint i = 0; i < n; ++i) base[i] = temp[i] % P;
+        }
+        exp >>= 1;
+    }
+
+    for (uint i = 0; i < n; ++i) out[i*n + j] = res[i] % P;
+}
+)CLC";
+
+// Try compute Q on GPU using OpenCL
+static bool build_Q_gpu(const Poly& F, std::vector<std::vector<Poly::value_t>>& Q) {
+    size_t n = F.deg();
+    if (n == 0) return false;
+    using vt = Poly::value_t;
+    vt P = F.getMod();
+
+    // prepare arrays
+    std::vector<cl_ulong> Fcoeffs(n), xp_coeffs(n);
+    for (size_t i = 0; i < n; ++i) {
+        Fcoeffs[i] = (i < F.deg() + 1) ? (cl_ulong)F[i] : 0;
+    }
+    Poly X({ 0,1 }, P);
+    Poly xp = poly_powmod(X, P, F);
+    xp.normalize();
+    for (size_t i = 0; i < n; ++i) xp_coeffs[i] = (i < xp.deg() + 1) ? (cl_ulong)xp[i] : 0;
+
+    cl_int err;
+    cl_uint platformCount = 0;
+    if (clGetPlatformIDs(0, nullptr, &platformCount) != CL_SUCCESS || platformCount == 0) return false;
+    std::vector<cl_platform_id> platforms(platformCount);
+    if ((err = clGetPlatformIDs(platformCount, platforms.data(), nullptr)) != CL_SUCCESS) return false;
+    cl_platform_id platform = platforms[0];
+
+    cl_uint deviceCount = 0;
+    if ((err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 0, nullptr, &deviceCount)) != CL_SUCCESS || deviceCount == 0) return false;
+    std::vector<cl_device_id> devices(deviceCount);
+    if ((err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, deviceCount, devices.data(), nullptr)) != CL_SUCCESS) return false;
+    cl_device_id device = devices[0];
+
+    cl_context_properties props[] = { CL_CONTEXT_PLATFORM, (cl_context_properties)platform, 0 };
+    cl_context context = clCreateContext(props, 1, &device, nullptr, nullptr, &err);
+    if (!context || err != CL_SUCCESS) return false;
+
+    cl_command_queue queue = nullptr;
+#if defined(CL_VERSION_2_0)
+    queue = clCreateCommandQueueWithProperties(context, device, 0, &err);
+#else
+    queue = clCreateCommandQueue(context, device, 0, &err);
+#endif
+    if (!queue || err != CL_SUCCESS) { clReleaseContext(context); return false; }
+
+    // build kernel
+    int MAXN = (int)std::max<size_t>(256, n);
+    // cap MAXN to reasonable size to avoid huge kernels
+    if (MAXN > 1024) MAXN = 1024;
+    // Create source string by replacing first "%d" with MAXN (avoid printf on template with "%")
+    std::string srcStr(kernelTemplate);
+    auto pos = srcStr.find("%d");
+    if (pos != std::string::npos) srcStr.replace(pos, 2, std::to_string(MAXN));
+    const char* src = srcStr.c_str();
+    size_t srcLen = srcStr.size();
+    cl_program program = clCreateProgramWithSource(context, 1, &src, &srcLen, &err);
+    if (!program || err != CL_SUCCESS) { clReleaseCommandQueue(queue); clReleaseContext(context); return false; }
+
+    err = clBuildProgram(program, 1, &device, nullptr, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        size_t logSize = 0;
+        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &logSize);
+        std::string log(logSize, '\0');
+        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, logSize, &log[0], nullptr);
+        std::cerr << "OpenCL build log:\n" << log << "\n";
+        clReleaseProgram(program);
+        clReleaseCommandQueue(queue);
+        clReleaseContext(context);
+        return false;
+    }
+
+    cl_kernel kernel = clCreateKernel(program, "compute_columns", &err);
+    if (!kernel || err != CL_SUCCESS) { clReleaseProgram(program); clReleaseCommandQueue(queue); clReleaseContext(context); return false; }
+
+    // Declare objects that have non-trivial constructors here to avoid MSVC C2362
+    cl_uint cln = 0;
+    cl_ulong clP = 0;
+    size_t global = 0;
+    std::vector<cl_ulong> out_flat;
+
+    size_t bytes_n = n * sizeof(cl_ulong);
+    size_t bytes_nn = n * n * sizeof(cl_ulong);
+    cl_mem bufF = nullptr;
+    cl_mem bufxp = nullptr;
+    cl_mem bufOut = nullptr;
+    bufF = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, bytes_n, Fcoeffs.data(), &err);
+    if (err != CL_SUCCESS) goto cl_error;
+    bufxp = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, bytes_n, xp_coeffs.data(), &err);
+    if (err != CL_SUCCESS) goto cl_error;
+    bufOut = clCreateBuffer(context, CL_MEM_WRITE_ONLY, bytes_nn, nullptr, &err);
+    if (err != CL_SUCCESS) goto cl_error;
+
+    cln = (cl_uint)n;
+    clP = (cl_ulong)P;
+    if ((err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &bufF)) != CL_SUCCESS) goto cl_error;
+    if ((err = clSetKernelArg(kernel, 1, sizeof(cl_uint), &cln)) != CL_SUCCESS) goto cl_error;
+    if ((err = clSetKernelArg(kernel, 2, sizeof(cl_ulong), &clP)) != CL_SUCCESS) goto cl_error;
+    if ((err = clSetKernelArg(kernel, 3, sizeof(cl_mem), &bufxp)) != CL_SUCCESS) goto cl_error;
+    if ((err = clSetKernelArg(kernel, 4, sizeof(cl_mem), &bufOut)) != CL_SUCCESS) goto cl_error;
+
+    global = n;
+    if ((err = clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, &global, nullptr, 0, nullptr, nullptr)) != CL_SUCCESS) goto cl_error;
+    clFinish(queue);
+
+    out_flat.assign(n * n, 0);
+    if ((err = clEnqueueReadBuffer(queue, bufOut, CL_TRUE, 0, bytes_nn, out_flat.data(), 0, nullptr, nullptr)) != CL_SUCCESS) goto cl_error;
+
+    Q.assign(n, std::vector<Poly::value_t>(n, 0));
+    for (size_t i = 0; i < n; ++i) for (size_t j = 0; j < n; ++j) Q[i][j] = (Poly::value_t)(out_flat[i * n + j] % P);
+
+    clReleaseMemObject(bufF); clReleaseMemObject(bufxp); clReleaseMemObject(bufOut);
+    clReleaseKernel(kernel); clReleaseProgram(program); clReleaseCommandQueue(queue); clReleaseContext(context);
+    return true;
+
+cl_error:
+    std::cerr << "[OpenCL] error code: " << err << "\n";
+    if (bufF) clReleaseMemObject(bufF);
+    if (bufxp) clReleaseMemObject(bufxp);
+    if (bufOut) clReleaseMemObject(bufOut);
+    if (kernel) clReleaseKernel(kernel);
+    if (program) clReleaseProgram(program);
+    if (queue) clReleaseCommandQueue(queue);
+    if (context) clReleaseContext(context);
+    return false;
+}
+#endif // HAVE_OPENCL
 
 std::string format(const Poly& p)
 {
@@ -101,19 +324,19 @@ std::vector<Poly> berlekamp(const Poly& F) {
 
     // === 1. Построение матрицы Q ===
     DLOG << "[berlekamp] building Q matrix (size " << n << ")...\n";
-    Poly X({0, 1}, F.getMod());
-    
-    Poly xp = poly_powmod(X, F.getMod(), F);
-    xp.normalize();
-
-    std::vector<std::vector<Poly::value_t>> Q(n, std::vector<Poly::value_t>(n, 0));
-    for (size_t j = 0; j < n; ++j) {
-        Poly col = poly_powmod(xp, j, F); // x^(p*j) mod F
-        for (size_t i = 0; i < col.deg() + 1; ++i)
-            Q[i][j] = col[i];
+    std::vector<std::vector<Poly::value_t>> Q;
+#if HAVE_OPENCL
+    bool ok = build_Q_gpu(F, Q);
+    if (!ok) {
+        std::cerr << "[parallel] OpenCL path failed, using CPU fallback\n";
+        build_Q_cpu(F, Q);
     }
-
-    // Q - I
+    else {
+        std::cout << "[parallel] Q computed on GPU\n";
+    }
+#else
+    build_Q_cpu(F, Q);
+#endif
     for (size_t i = 0; i < n; ++i) Q[i][i] = modnorm(Q[i][i] - 1, F.getMod());
 
     DLOG << "[berlekamp] matrix (Q - I):\n";
@@ -188,6 +411,7 @@ std::vector<Poly> berlekamp(const Poly& F) {
 
             Poly g = poly_gcd(F, h);
             if (!g.isZero() && g.deg() >= 1 && g.deg() < F.deg()) {
+                g.normalize();
                 DLOG << "[berlekamp] non-trivial factor found: " << format(g)
                     << " (with c=" << c << ")\n";
                 Poly f1 = g;
@@ -266,6 +490,7 @@ int main(int argc, char* argv[]) {
             }
 
             Poly f(coeffs, mod);
+            f.setNormalize(); // input always noramlized
             DLOG << "Input polynomial: over GF(" << mod << ")\n";
 
             auto res = factor_poly(f);
