@@ -2,7 +2,24 @@
 
 #include <chrono>
 #include <iostream>
+#include <filesystem>
+#include <fstream>
+#include <chrono>
 #include <string>
+
+#define LOG std::cout
+
+#ifndef NDEBUG
+#define DLOG std::cout
+#else
+struct Dummy {
+    constexpr Dummy() {}
+    template<typename T>
+    inline constexpr Dummy& operator<<(const T&) const { return *this;  }
+};
+static constexpr Dummy __d{};
+#define DLOG __d
+#endif
 
 std::string format(const Poly& p)
 {
@@ -74,7 +91,7 @@ std::vector<int> matrix_rref(std::vector<std::vector<Poly::value_t>>& M, Poly::v
 }
 
 std::vector<Poly> berlekamp(const Poly& F) {
-    std::cout << "[berlekamp] factoring (squarefree) " << format(F) << "\n";
+    DLOG << "[berlekamp] factoring (squarefree) " << format(F) << "\n";
 
     std::vector<Poly> result;
     if (F.isZero()) return result;
@@ -83,7 +100,7 @@ std::vector<Poly> berlekamp(const Poly& F) {
     size_t n = F.deg();
 
     // === 1. Построение матрицы Q ===
-    std::cout << "[berlekamp] building Q matrix (size " << n << ")...\n";
+    DLOG << "[berlekamp] building Q matrix (size " << n << ")...\n";
     Poly X({0, 1}, F.getMod());
     
     Poly xp = poly_powmod(X, F.getMod(), F);
@@ -99,10 +116,10 @@ std::vector<Poly> berlekamp(const Poly& F) {
     // Q - I
     for (size_t i = 0; i < n; ++i) Q[i][i] = modnorm(Q[i][i] - 1, F.getMod());
 
-    std::cout << "[berlekamp] matrix (Q - I):\n";
+    DLOG << "[berlekamp] matrix (Q - I):\n";
     for (size_t i = 0; i < n; ++i) {
-        for (size_t j = 0; j < n; ++j) std::cout << Q[i][j] << ' ';
-        std::cout << '\n';
+        for (size_t j = 0; j < n; ++j) DLOG << Q[i][j] << ' ';
+        DLOG << '\n';
     }
 
     // === 2. Базис ядра ===
@@ -118,7 +135,7 @@ std::vector<Poly> berlekamp(const Poly& F) {
         if (pivot_of_col[c] == -1)
             free_cols.push_back(c);
 
-    std::cout << "[berlekamp] nullspace dimension = " << free_cols.size() << "\n";
+    DLOG << "[berlekamp] nullspace dimension = " << free_cols.size() << "\n";
 
     std::vector<Poly> basis;
     for (size_t idx = 0; idx < free_cols.size(); ++idx) {
@@ -133,17 +150,17 @@ std::vector<Poly> berlekamp(const Poly& F) {
 
         Poly b(vec, F.getMod());
         b.normalize();
-        std::cout << "[berlekamp] basis[" << idx << "] = " << format(b) << "\n";
+        DLOG << "[berlekamp] basis[" << idx << "] = " << format(b) << "\n";
         basis.push_back(std::move(b));
     }
 
     if (basis.empty()) {
-        std::cout << "[berlekamp] nullspace trivial -> irreducible: " << format(F) << "\n";
+        DLOG << "[berlekamp] nullspace trivial -> irreducible: " << format(F) << "\n";
         result.push_back(F);
         return result;
     }
     if (basis.size() == 1 && basis.front().deg() == 0) {
-        std::cout << "[berlekamp] nullspace contains only constants -> irreducible\n";
+        DLOG << "[berlekamp] nullspace contains only constants -> irreducible\n";
         result.push_back(F);
         return result;
     }
@@ -152,7 +169,7 @@ std::vector<Poly> berlekamp(const Poly& F) {
     for (size_t bi = 0; bi < basis.size(); ++bi) {
         const Poly& v = basis[bi];
         if (v.deg() == 0) continue; // пропускаем константу
-        std::cout << "[berlekamp] trying basis vector: " << format(v) << "\n";
+        DLOG << "[berlekamp] trying basis vector: " << format(v) << "\n";
 
         for (size_t c = 0; c < F.getMod(); ++c) {
             Poly h = v;
@@ -171,29 +188,29 @@ std::vector<Poly> berlekamp(const Poly& F) {
 
             Poly g = poly_gcd(F, h);
             if (!g.isZero() && g.deg() >= 1 && g.deg() < F.deg()) {
-                std::cout << "[berlekamp] non-trivial factor found: " << format(g)
+                DLOG << "[berlekamp] non-trivial factor found: " << format(g)
                     << " (with c=" << c << ")\n";
                 Poly f1 = g;
                 Poly f2 = poly_divmod(F, f1).first;
 
                 auto r1 = berlekamp(f1);
                 auto r2 = berlekamp(f2);
-                result.insert(result.end(), r1.begin(), r1.end());
-                result.insert(result.end(), r2.begin(), r2.end());
+                std::transform(r1.begin(), r1.end(), std::back_inserter(result), [](Poly& p) { p.normalize(); return p; });
+                std::transform(r2.begin(), r2.end(), std::back_inserter(result), [](Poly& p) { p.normalize(); return p; });
                 return result;
             }
         }
     }
 
     // === 4. Если ничего не нашли ===
-    std::cout << "[berlekamp] failed to split -> irreducible: " << format(F) << "\n";
+    DLOG << "[berlekamp] failed to split -> irreducible: " << format(F) << "\n";
     result.push_back(F);
     return result;
 }
 
 // full factorization using squarefree + berlekamp
 std::vector<Poly> factor_poly(Poly& F) {
-    std::cout << "[factor] starting full factorization for " << format(F) << "\n";
+    DLOG << "[factor] starting full factorization for " << format(F) << "\n";
 
     F.normalize();
     if (F.isZero()) return {};
@@ -205,34 +222,60 @@ std::vector<Poly> factor_poly(Poly& F) {
     return berlekamp(F);
 }
 
-int main() {
-    std::cout << "Berlekamp factorization (no external libs)\n";
-    std::cout << "Enter prime p, degree n, and n+1 coefficients (highest first):\n";
+int main(int argc, char* argv[]) {
+    namespace fs = std::filesystem;
 
-    uint64_t mod;
-    if (!(std::cin >> mod))
-        return 0;
+    if (argc < 2) {
+        LOG << "Usage: program <directory_path>\n";
+        return 1;
+    }
 
-    size_t n;
-    std::cin >> n;
+    fs::path dirPath = argv[1];
+    if (!fs::exists(dirPath) || !fs::is_directory(dirPath)) {
+        LOG << "Invalid directory path\n";
+        return 2;
+    }
 
-    std::vector<Poly::value_t> coeffs(n + 1);
-    for (int i = static_cast<int>(n); i >= 0; --i)
-        std::cin >> coeffs[i];
+    for (const auto& entry : fs::directory_iterator(dirPath)) {
+        if (!entry.is_regular_file())
+            continue;
 
-    Poly f(coeffs, mod);
-    std::cout << "Input polynomial: over GF(" << mod << ")\n";
+        std::ifstream file(entry.path());
+        if (!file.is_open()) {
+            LOG << "Failed to open file: " << entry.path() << "\n";
+            continue;
+        }
 
-    auto t0 = std::chrono::high_resolution_clock::now();
-    auto res = factor_poly(f);
-    auto t1 = std::chrono::high_resolution_clock::now();
+        LOG << "Processing file: " << entry.path() << "\n";
 
-    std::cout << "\n=== RESULT: irreducible factors (factor, multiplicity) ===\n";
-    for (auto& pr : res)
-        std::cout << "(" << format(pr) << ")\n";
+        const auto begin = std::chrono::high_resolution_clock::now();
+        std::string line;
+        while (std::getline(file, line)) {
+            if (line.empty())
+                continue;
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-    std::cout << "Elapsed time: " << ms << " ms\n";
+            std::istringstream iss(line);
+
+            Poly::value_t mod;
+            iss >> mod;
+
+            std::vector<Poly::value_t> coeffs;
+            Poly::value_t x;
+            while (iss >> x) {
+                coeffs.push_back(x);
+            }
+
+            Poly f(coeffs, mod);
+            DLOG << "Input polynomial: over GF(" << mod << ")\n";
+
+            auto res = factor_poly(f);
+            DLOG << "\n=== RESULT: irreducible factors (factor, multiplicity) ===\n";
+            for (auto& pr : res)
+                DLOG << "(" << format(pr) << ")\n";
+        }
+        const auto end = std::chrono::high_resolution_clock::now();
+        LOG << "Time ellapsed " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << " ms\n";
+    }
 
     return 0;
 }
